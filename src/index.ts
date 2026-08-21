@@ -77,7 +77,19 @@ function resolveBaseUrl(): string {
   return DEFAULT_BASE_URL;
 }
 
+interface RouterCapabilities {
+  reasoning?: boolean;
+  vision?: boolean;
+  contextWindow?: number;
+  maxOutput?: number;
+  thinkingFormat?: string;
+  thinkingCanDisable?: boolean;
+}
+
 interface RouterModel {
+  id?: string;
+  name?: string;
+  capabilities?: RouterCapabilities;
   [key: string]: unknown;
 }
 
@@ -122,11 +134,26 @@ function firstTokenCount(entry: RouterModel, keys: string[]): number | undefined
 function mapModel(entry: RouterModel, baseUrl: string): Model<"openai-completions"> {
   const id = typeof entry.id === "string" ? entry.id : "";
   const name = typeof entry.name === "string" && entry.name.trim() ? entry.name : id;
-  const contextWindow = firstTokenCount(entry, CONTEXT_KEYS) ?? FALLBACK_CONTEXT_WINDOW;
+  const caps = entry.capabilities;
+
+  const contextWindow =
+    (typeof caps?.contextWindow === "number" && caps.contextWindow > 0 ? caps.contextWindow : undefined) ??
+    firstTokenCount(entry, CONTEXT_KEYS) ??
+    FALLBACK_CONTEXT_WINDOW;
+
   const maxTokens = Math.min(
-    firstTokenCount(entry, MAX_TOKENS_KEYS) ?? FALLBACK_MAX_TOKENS,
+    (typeof caps?.maxOutput === "number" && caps.maxOutput > 0 ? caps.maxOutput : undefined) ??
+    firstTokenCount(entry, MAX_TOKENS_KEYS) ??
+    FALLBACK_MAX_TOKENS,
     contextWindow,
   );
+
+  const isReasoning =
+    typeof caps?.reasoning === "boolean"
+      ? caps.reasoning
+      : /r1|reasoner|o1|o3|o4|gemini|thinking|flash/i.test(id);
+
+  const input: ("text" | "image")[] = caps?.vision ? ["text", "image"] : ["text"];
 
   return {
     id,
@@ -134,15 +161,15 @@ function mapModel(entry: RouterModel, baseUrl: string): Model<"openai-completion
     api: "openai-completions",
     provider: PROVIDER_ID,
     baseUrl,
-    reasoning: false,
-    input: ["text"],
+    reasoning: isReasoning,
+    input,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens,
     compat: {
-      // 9router's translators read max_tokens and expect a "system" role.
       maxTokensField: "max_tokens",
       supportsDeveloperRole: false,
+      supportsReasoningEffort: true,
     },
   };
 }
