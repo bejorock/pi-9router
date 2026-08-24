@@ -39,14 +39,6 @@ const API_KEY_ENV = "NINE_ROUTER_API_KEY";
 const FALLBACK_CONTEXT_WINDOW = 128000;
 const FALLBACK_MAX_TOKENS = 4096;
 
-/** Appended to 9router's system prompt to push deeper reasoning. */
-const REASONING_SUFFIX = [
-  "Before answering, think as hard and as deeply as possible:",
-  "- Reason through the problem step by step.",
-  "- Enumerate the possible approaches, weigh the trade-offs of each, then decide.",
-  "- Critically review your own answer for correctness, edge cases, and unstated assumptions before finalizing.",
-].join("\n");
-
 /** Path to pi's global models.json (honors a relocated agent dir). */
 function modelsJsonPath(): string {
   return join(
@@ -237,13 +229,6 @@ export default function (pi: ExtensionAPI) {
       api: openAICompletionsApi(),
     }),
   );
-
-  // Inject deeper-reasoning instructions into 9router's system prompt.
-  pi.on("before_agent_start", (event, ctx) => {
-    if (ctx.model?.provider !== PROVIDER_ID) return;
-    if (event.systemPrompt.includes(REASONING_SUFFIX)) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${REASONING_SUFFIX}` };
-  });
 
   // Helper to resolve baseUrl + apiKey at tool call time.
   async function resolveAuth(ctx: ExtensionContext) {
