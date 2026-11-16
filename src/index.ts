@@ -25,12 +25,14 @@
  */
 
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
-import type { Model, RefreshModelsContext } from "@earendil-works/pi-ai";
+import type { Model, RefreshModelsContext, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { guardProviderStreams } from "./stream-guard.ts";
 import { web_search, web_fetch, formatSearchResponse, formatFetchResponse } from "./web.ts";
 
 const PROVIDER_ID = "9router";
@@ -87,12 +89,13 @@ interface RouterModel {
 
 function toTokenCount(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return Math.floor(value);
+    const count = Math.floor(value);
+    return count > 0 ? count : undefined;
   }
   if (typeof value !== "string") return undefined;
   const normalized = value.replace(/,/g, "").trim();
-  const n = Number(normalized);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+  const n = Math.floor(Number(normalized));
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 const CONTEXT_KEYS = [
@@ -123,18 +126,41 @@ function firstTokenCount(entry: RouterModel, keys: string[]): number | undefined
   return undefined;
 }
 
-function mapModel(entry: RouterModel, baseUrl: string): Model<"openai-completions"> {
+/** Router levels describe accepted reasoning_effort values, not backend wire formats. */
+function thinkingLevelMap(entry: RouterModel): ThinkingLevelMap | undefined {
+  const advertised = Array.isArray(entry.thinking_levels)
+    ? entry.thinking_levels.filter((level): level is string => typeof level === "string")
+    : [];
+  const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+  if (!advertised.length) {
+    return entry.capabilities?.thinkingCanDisable === false ? { off: null } : undefined;
+  }
+  const mapping: ThinkingLevelMap = {};
+  for (const level of levels) {
+    const wireValue = level === "off" ? "none" : level;
+    mapping[level] = advertised.includes(wireValue) ? wireValue : null;
+  }
+  // Binary backends advertise "thinking" rather than a numeric effort tier.
+  if (advertised.includes("thinking") && !levels.some((level) => level !== "off" && mapping[level])) {
+    mapping.high = "high"; // 9router normalizes any enabled effort to binary thinking.
+  }
+  if (entry.capabilities?.thinkingCanDisable === false) mapping.off = null;
+  // Unknown future-only levels must not leave pi with zero selectable levels.
+  return Object.values(mapping).some((value) => value !== null) ? mapping : undefined;
+}
+
+export function mapModel(entry: RouterModel, baseUrl: string): Model<"openai-completions"> {
   const id = typeof entry.id === "string" ? entry.id : "";
   const name = typeof entry.name === "string" && entry.name.trim() ? entry.name : id;
   const caps = entry.capabilities;
 
   const contextWindow =
-    (typeof caps?.contextWindow === "number" && caps.contextWindow > 0 ? caps.contextWindow : undefined) ??
+    toTokenCount(caps?.contextWindow) ??
     firstTokenCount(entry, CONTEXT_KEYS) ??
     FALLBACK_CONTEXT_WINDOW;
 
   const maxTokens = Math.min(
-    (typeof caps?.maxOutput === "number" && caps.maxOutput > 0 ? caps.maxOutput : undefined) ??
+    toTokenCount(caps?.maxOutput) ??
     firstTokenCount(entry, MAX_TOKENS_KEYS) ??
     FALLBACK_MAX_TOKENS,
     contextWindow,
@@ -154,6 +180,7 @@ function mapModel(entry: RouterModel, baseUrl: string): Model<"openai-completion
     provider: PROVIDER_ID,
     baseUrl,
     reasoning: isReasoning,
+    thinkingLevelMap: isReasoning ? thinkingLevelMap(entry) : undefined,
     input,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
@@ -162,12 +189,14 @@ function mapModel(entry: RouterModel, baseUrl: string): Model<"openai-completion
       maxTokensField: "max_tokens",
       supportsDeveloperRole: false,
       supportsReasoningEffort: true,
+      // 9router translates this OpenAI envelope into the backend's thinkingFormat.
+      thinkingFormat: "openai",
     },
   };
 }
 
-async function fetchModels(context: RefreshModelsContext): Promise<readonly Model<"openai-completions">[]> {
-  const baseUrl = resolveBaseUrl();
+export async function fetchModels(context: RefreshModelsContext): Promise<readonly Model<"openai-completions">[]> {
+  const baseUrl = normalizeBaseUrl(context.baseUrl ?? resolveBaseUrl());
   const headers: Record<string, string> = { Accept: "application/json" };
 
   const credential = context.credential;
@@ -192,6 +221,16 @@ async function fetchModels(context: RefreshModelsContext): Promise<readonly Mode
   return entries
     .filter((entry) => typeof entry.id === "string" && entry.id.trim())
     .map((entry) => mapModel(entry, baseUrl));
+}
+
+/** Keep large pages out of the model context while preserving the complete text. */
+async function toolText(text: string): Promise<string> {
+  const truncated = truncateHead(text);
+  if (!truncated.truncated) return text;
+  const directory = await mkdtemp(join(tmpdir(), "pi-9router-"));
+  const path = join(directory, "output.txt");
+  await writeFile(path, text, { mode: 0o600 });
+  return `${truncated.content}\n\n[Output truncated. Full content saved to ${path}]`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -226,16 +265,23 @@ export default function (pi: ExtensionAPI) {
 
       models: [],
       fetchModels,
-      api: openAICompletionsApi(),
+      api: guardProviderStreams(openAICompletionsApi()),
     }),
   );
 
   // Helper to resolve baseUrl + apiKey at tool call time.
   async function resolveAuth(ctx: ExtensionContext) {
-    const baseUrl = resolveBaseUrl();
     const providerAuth = await ctx.modelRegistry.getProviderAuth(PROVIDER_ID);
-    const apiKey = providerAuth?.auth?.apiKey ?? process.env[API_KEY_ENV] ?? "";
-    return { baseUrl, apiKey };
+    const baseUrl = normalizeBaseUrl(
+      providerAuth?.auth.baseUrl ?? ctx.modelRegistry.getProvider(PROVIDER_ID)?.baseUrl ?? resolveBaseUrl(),
+    );
+    const apiKey = providerAuth?.auth.apiKey ?? process.env[API_KEY_ENV] ?? "";
+    const headers = Object.fromEntries(
+      Object.entries(providerAuth?.auth.headers ?? {}).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
+    return { baseUrl, apiKey, headers };
   }
 
   pi.registerTool({
@@ -261,14 +307,14 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
-        const { baseUrl, apiKey } = await resolveAuth(ctx);
+        const { baseUrl, apiKey, headers } = await resolveAuth(ctx);
         const result = await web_search(baseUrl, apiKey, {
           query: params.query,
           search_type: params.search_type,
           max_results: params.max_results,
-        });
+        }, { signal, headers });
         return {
-          content: [{ type: "text" as const, text: formatSearchResponse(result) }],
+          content: [{ type: "text" as const, text: await toolText(formatSearchResponse(result)) }],
           details: result,
         };
       } catch (err) {
@@ -296,10 +342,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
-        const { baseUrl, apiKey } = await resolveAuth(ctx);
-        const result = await web_fetch(baseUrl, apiKey, params.url);
+        const { baseUrl, apiKey, headers } = await resolveAuth(ctx);
+        const result = await web_fetch(baseUrl, apiKey, params.url, undefined, { signal, headers });
         return {
-          content: [{ type: "text" as const, text: formatFetchResponse(result) }],
+          content: [{ type: "text" as const, text: await toolText(formatFetchResponse(result)) }],
           details: result,
         };
       } catch (err) {

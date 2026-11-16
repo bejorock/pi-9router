@@ -9,6 +9,17 @@ export interface WebSearchArgs {
   language?: string | null;
 }
 
+/**
+ * Optional per-request transport options shared by every web helper.
+ * `signal` cancels discovery, requests, and provider fallback;
+ * `headers` are merged into the request headers (Authorization is only set
+ * when an apiKey is provided).
+ */
+export interface WebRequestOptions {
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+}
+
 export interface SearchResultCitation {
   provider: string | null;
   rank: number | null;
@@ -31,16 +42,26 @@ export interface SearchResult {
   position: number | null;
   score: number | null;
   published_at: string | null;
-  content: string | null;
+  content: FetchContent | null;
   provider_raw: unknown | null;
   citation: SearchResultCitation | null;
   metadata: SearchResultMetadata | null;
 }
 
+/**
+ * Chat-search providers return a synthesized answer object; dedicated
+ * providers leave `answer` null. Older servers returned a plain string.
+ */
+export interface SearchAnswer {
+  source: string | null;
+  text: string | null;
+  model: string | null;
+}
+
 export interface WebSearchResponse {
   query: string;
   provider: string;
-  answer: string | null;
+  answer: string | SearchAnswer | null;
   results: SearchResult[];
   error?: { message: string };
 }
@@ -82,10 +103,10 @@ export interface FetchResult {
   url: string;
   title: string | null;
   provider: string;
-  content: FetchContent;
-  metadata: FetchMetadata;
-  usage: FetchUsage;
-  metrics: FetchMetrics;
+  content: FetchContent | null;
+  metadata: FetchMetadata | null;
+  usage?: FetchUsage;
+  metrics?: FetchMetrics;
 }
 
 interface WebFetchResponse extends FetchResult {
@@ -97,6 +118,12 @@ interface WebFetchResponse extends FetchResult {
  */
 export function formatSearchResponse(response: WebSearchResponse): string {
   const lines: string[] = [`Query: ${response.query}`, `Provider: ${response.provider}`, ""];
+
+  const answer =
+    typeof response.answer === "string" ? response.answer : response.answer?.text ?? null;
+  if (answer) {
+    lines.push("Answer:", answer, "");
+  }
 
   for (const r of response.results) {
     lines.push(`[${r.position}] ${r.title ?? "(no title)"}`);
@@ -119,10 +146,10 @@ export function formatFetchResponse(result: FetchResult): string {
   if (result.title) lines.push(`Title: ${result.title}`);
   lines.push(`URL: ${result.url}`);
   lines.push(`Provider: ${result.provider}`);
-  if (result.metadata.author) lines.push(`Author: ${result.metadata.author}`);
-  if (result.metadata.published_at) lines.push(`Published: ${result.metadata.published_at}`);
+  if (result.metadata?.author) lines.push(`Author: ${result.metadata.author}`);
+  if (result.metadata?.published_at) lines.push(`Published: ${result.metadata.published_at}`);
   lines.push("");
-  if (result.content.text) lines.push(result.content.text);
+  if (result.content?.text) lines.push(result.content.text);
 
   return lines.join("\n").trim();
 }
@@ -136,6 +163,31 @@ export function toProvider(modelId: string): string {
 }
 
 /**
+ * Build request headers for 9router web endpoints.
+ *
+ * Caller-provided headers are always forwarded; an explicit non-empty apiKey
+ * wins over a caller-provided Authorization, and an empty apiKey adds none
+ * (so header-based auth or unauthenticated local mode keeps working).
+ */
+function buildHeaders(
+  apiKey: string,
+  options?: WebRequestOptions,
+  json = false,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (json) headers["Content-Type"] = "application/json";
+
+  for (const [key, value] of Object.entries(options?.headers ?? {})) {
+    if (apiKey && key.toLowerCase() === "authorization") continue;
+    headers[key] = value;
+  }
+
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  return headers;
+}
+
+/**
  * Get available web models from 9router's /v1/models/web endpoint.
  * @param baseUrl - 9router base URL (e.g. http://localhost:20128/v1)
  * @param apiKey - 9router API key
@@ -145,9 +197,13 @@ export async function get_web_models(
   baseUrl: string,
   apiKey: string,
   kind?: "webSearch" | "webFetch",
+  options?: WebRequestOptions,
 ): Promise<WebModelsResponse> {
+  options?.signal?.throwIfAborted();
+
   const response = await fetch(`${baseUrl}/models/web`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: buildHeaders(apiKey, options),
+    signal: options?.signal,
   });
 
   if (!response.ok) {
@@ -169,7 +225,10 @@ async function _do_search(
   apiKey: string,
   provider: string,
   args: WebSearchArgs,
+  options?: WebRequestOptions,
 ): Promise<WebSearchResponse> {
+  options?.signal?.throwIfAborted();
+
   const body: Record<string, unknown> = {
     model: provider,
     query: args.query,
@@ -182,11 +241,9 @@ async function _do_search(
 
   const response = await fetch(`${baseUrl}/search`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: buildHeaders(apiKey, options, true),
     body: JSON.stringify(body),
+    signal: options?.signal,
   });
 
   const text = await response.text();
@@ -213,26 +270,32 @@ export async function web_search(
   baseUrl: string,
   apiKey: string,
   args: WebSearchArgs,
+  options?: WebRequestOptions,
 ): Promise<WebSearchResponse> {
   if (args.max_results !== undefined && args.max_results > 50) {
     throw new Error("max_results cannot exceed 50");
   }
 
+  options?.signal?.throwIfAborted();
+
   if (args.model) {
-    return _do_search(baseUrl, apiKey, args.model, args);
+    return _do_search(baseUrl, apiKey, args.model, args, options);
   }
 
-  const { data: models } = await get_web_models(baseUrl, apiKey, "webSearch");
+  const { data: models } = await get_web_models(baseUrl, apiKey, "webSearch", options);
   if (models.length === 0) {
     throw new Error("No webSearch providers available");
   }
 
   const errors: string[] = [];
   for (const model of models) {
+    // Cancellation must never trigger another provider attempt.
+    options?.signal?.throwIfAborted();
     const provider = toProvider(model.id);
     try {
-      return await _do_search(baseUrl, apiKey, provider, args);
+      return await _do_search(baseUrl, apiKey, provider, args, options);
     } catch (err) {
+      options?.signal?.throwIfAborted();
       errors.push(`${provider}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -245,14 +308,15 @@ async function _do_fetch(
   apiKey: string,
   provider: string,
   url: string,
+  options?: WebRequestOptions,
 ): Promise<FetchResult> {
+  options?.signal?.throwIfAborted();
+
   const response = await fetch(`${baseUrl}/web/fetch`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
+    headers: buildHeaders(apiKey, options, true),
     body: JSON.stringify({ model: provider, url }),
+    signal: options?.signal,
   });
 
   const text = await response.text();
@@ -281,22 +345,28 @@ export async function web_fetch(
   apiKey: string,
   url: string,
   model?: string,
+  options?: WebRequestOptions,
 ): Promise<FetchResult> {
+  options?.signal?.throwIfAborted();
+
   if (model) {
-    return _do_fetch(baseUrl, apiKey, model, url);
+    return _do_fetch(baseUrl, apiKey, model, url, options);
   }
 
-  const { data: models } = await get_web_models(baseUrl, apiKey, "webFetch");
+  const { data: models } = await get_web_models(baseUrl, apiKey, "webFetch", options);
   if (models.length === 0) {
     throw new Error("No webFetch providers available");
   }
 
   const errors: string[] = [];
   for (const m of models) {
+    // Cancellation must never trigger another provider attempt.
+    options?.signal?.throwIfAborted();
     const provider = toProvider(m.id);
     try {
-      return await _do_fetch(baseUrl, apiKey, provider, url);
+      return await _do_fetch(baseUrl, apiKey, provider, url, options);
     } catch (err) {
+      options?.signal?.throwIfAborted();
       errors.push(`${provider}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }

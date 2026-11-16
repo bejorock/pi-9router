@@ -1,5 +1,6 @@
 node_modules/
 .pi/
+.pi-workflow/
 *.log
 .DS_Store
 npm-debug.log*
