@@ -89,6 +89,7 @@ test("discovery omits empty credentials and surfaces remote-auth failures", asyn
 function captureTools() {
   const tools: ToolDefinition[] = [];
   register({
+    on() {},
     registerProvider() {},
     registerTool(tool: ToolDefinition) { tools.push(tool); },
   } as unknown as ExtensionAPI);

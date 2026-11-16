@@ -33,6 +33,7 @@ import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai/comp
 import type { Model, RefreshModelsContext, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { guardProviderStreams } from "./stream-guard.ts";
+import { rewriteAgPayload } from "./ag-prompt.ts";
 import { web_search, web_fetch, formatSearchResponse, formatFetchResponse } from "./web.ts";
 
 const PROVIDER_ID = "9router";
@@ -234,6 +235,8 @@ async function toolText(text: string): Promise<string> {
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.on("before_provider_request", (event, ctx) => rewriteAgPayload(event.payload, ctx.model));
+
   pi.registerProvider(
     createProvider<"openai-completions">({
       id: PROVIDER_ID,

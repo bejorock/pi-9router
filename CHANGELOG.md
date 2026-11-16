@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add a request-only prompt compatibility workaround exclusively for `9router/ag/*` using OpenAI Chat Completions: replace pi's exact default identity and remove only its recognized built-in documentation block. Preserve custom prompts, tools, project content, user/history messages, other models, and other providers.
+- Add model-switch, non-mutation, custom-docs, and actual pi wire-level isolation regression tests.
+
 ## 0.2.0
 
 - Verify compatibility with pi 1.5.2 and 9router 0.5.119 while preserving the native provider/auth/catalog integration.

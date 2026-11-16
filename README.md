@@ -88,6 +88,30 @@ Current 9router advertises per-model capabilities and `thinking_levels`; these a
 - Web tools require a configured search/fetch provider in 9router. Current 9router blocks fetches to private/internal targets as an SSRF safeguard.
 - Print mode and offline model listing use pi's cached catalog; refresh through an interactive session or `/model` after updating 9router.
 
+## Antigravity prompt compatibility
+
+Only when the selected model has provider **`9router`**, an ID starting with
+**`ag/`**, and the OpenAI Chat Completions API, a `before_provider_request` hook:
+
+- Replaces pi's exact default opening identity with: `You are a coding assistant running inside a coding agent harness. Help users inspect files, run commands, and modify code.`
+- Removes the recognized built-in pi documentation section from that default system prompt.
+
+This works around observed prompt-sensitive `503` / upstream `429
+RESOURCE_EXHAUSTED` responses on `ag/gemini-3.8-flash-high`. It does not establish
+the upstream cause or guarantee that every AG model accepts every prompt.
+
+Tools and their schemas, rules, cwd, project instructions, skills, user messages,
+and conversation history are preserved. Other providers and non-`ag/` 9router
+models return the original payload unchanged. The rewrite copies only the
+outgoing payload, so switching models requires no restoration and does not alter
+stored prompts or `ctx.getSystemPrompt()`.
+
+Matching is intentionally conservative: only the leading string system message
+with pi's exact default preamble is eligible. Custom prompts are untouched;
+unknown/future documentation templates and unrelated `<docs>` blocks are kept.
+The trade-off for AG requests is losing pi's automatic documentation-location
+guidance. This is not a blanket removal of the word `pi` from project content.
+
 ## Repetitive-stream guard
 
 The provider's native stream is wrapped with a conservative guard for the observed
@@ -136,7 +160,7 @@ npm run test:integration
 npm pack --dry-run
 ```
 
-Unit tests cover current/legacy model metadata, endpoint/auth composition, web-provider fallback, cancellation, output truncation, and a sanitized replay retaining the actual incident's chunk boundaries/timing. Integration tests start a local HTTP SSE server and actual pi process to prove guard-triggered native retry over HTTP 200/201, disabled/exhausted retry budgets, request cancellation, and no tool execution. No real API keys are needed.
+Unit tests cover current/legacy model metadata, endpoint/auth composition, web-provider fallback, cancellation, output truncation, AG-only prompt rewriting/model-switch isolation, and a sanitized replay retaining the actual incident's chunk boundaries/timing. Integration tests start a local HTTP SSE server and actual pi process to prove AG prompt rewriting and other-provider payload equivalence, guard-triggered native retry over HTTP 200/201, disabled/exhausted retry budgets, request cancellation, and no tool execution. No real API keys are needed.
 
 ## License
 
