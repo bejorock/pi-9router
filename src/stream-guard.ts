@@ -1,65 +1,47 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/compat";
 import type { AssistantMessage, ProviderStreams, StreamFunction } from "@earendil-works/pi-ai";
 
-/** Fixed text: model-supplied snippets could interfere with pi's retry classifier. */
-export const REPETITION_ERROR = "upstream_stream_read_error: repetitive tool arguments detected locally; incomplete call not executed";
+/** Fixed text: generated snippets must not influence pi's retry classifier. */
+export const REPETITION_ERROR = "upstream_stream_read_error: sustained repetitive generation detected locally; response discarded";
 const WINDOW = 2048;
+const INVISIBLE_WINDOW = 512;
 
 /**
- * Deliberately narrow signature of the observed bash degeneration, not a general
- * entropy detector: an unfinished, single-line command string ends in a very
- * long exact cycle of short prose fragments (letters, spaces and periods).
- * Healthy repeated data, JSON arrays, heredocs, padding and other tools are not
- * classified. Even this signature cannot prove intent; bounded native retries
- * contain false positives. Memory is bounded independently of generation length.
+ * A stream-behavior detector, not a semantic judge. Classifies only exact short
+ * cycles: unstructured prose, or U+200B/U+200C runs (literal or JSON escaped).
+ * State is bounded and independent for each content block and event channel.
  */
-export class ArgumentRepetitionDetector {
+export class StreamDegenerationDetector {
   private tail = "";
-  private prefix = "";
   private total = 0;
   private deltas = 0;
-  private inString = false;
-  private escaped = false;
-  private excluded = false;
-  private quotes = 0;
-  private quotedLiteral = false;
-  private singleQuotedLiteral = false;
-  private candidate?: { since: number; chars: number; deltas: number; pattern: string };
+  private candidate?: { since: number; chars: number; deltas: number; pattern: string; kind: string };
 
-  observe(delta: string, toolName: string, now: number): boolean {
+  observe(delta: string, now: number): boolean {
     if (!delta) return false;
     this.total += delta.length;
     this.deltas++;
-    this.prefix = (this.prefix + delta).slice(0, 128);
-    // Scan raw JSON, not parsed partial arguments (pi only finalizes those at end).
-    for (const char of delta) {
-      if (char === "\n" || char === "\r" || (this.escaped && char === "n")) this.excluded = true;
-      if (this.escaped) {
-        // Encoded double quotes usually delimit quoted shell/data literals. Do
-        // not interrupt while such a literal is open (conservative opt-out).
-        if (char === '"') this.quotedLiteral = !this.quotedLiteral;
-        this.escaped = false;
-        continue;
-      }
-      if (this.inString && char === "\\") { this.escaped = true; continue; }
-      if (this.inString && char === "'") this.singleQuotedLiteral = !this.singleQuotedLiteral;
-      if (char === '"') {
-        this.inString = !this.inString;
-        if (++this.quotes >= 4) this.excluded = true; // command value already closed
-      }
-    }
     this.tail = (this.tail + delta).slice(-WINDOW);
-    if (toolName !== "bash" || this.excluded || this.quotedLiteral || this.singleQuotedLiteral || !this.inString || this.escaped ||
-        !/^\s*\{\s*"command"\s*:\s*"/.test(this.prefix) || this.total < 4096 || this.tail.length < WINDOW) {
-      this.candidate = undefined;
-      return false;
+    let pattern: string | undefined;
+    let kind = "invisible";
+    if (this.total >= 1024 && this.tail.length >= INVISIBLE_WINDOW) {
+      const unit = minimalCycle(this.tail.slice(-INVISIBLE_WINDOW));
+      if (unit && isInvisibleCycle(unit)) pattern = unit;
     }
-    const pattern = periodicFragment(this.tail);
+    if (!pattern && this.total >= 4096 && this.tail.length === WINDOW) {
+      const unit = minimalCycle(this.tail);
+      // Deliberately exclude structural syntax, digits, newlines and punctuation
+      // used in CSV/code/JSON. Genuine long repeated prose remains ambiguous.
+      if (unit && /\p{L}/u.test(unit) && unit.includes(" ") && /^[\p{L}\p{M} .!?]+$/u.test(unit)) {
+        pattern = unit;
+        kind = "prose";
+      }
+    }
     if (!pattern) { this.candidate = undefined; return false; }
-    // Phase can rotate between deltas. Compare cycles up to rotation.
-    if (!this.candidate || !(this.candidate.pattern + this.candidate.pattern).includes(pattern) ||
-        this.candidate.pattern.length !== pattern.length) {
-      this.candidate = { since: now, chars: this.total, deltas: this.deltas, pattern };
+    // Chunk boundaries rotate the minimal cycle. Do not mix signatures.
+    if (!this.candidate || this.candidate.kind !== kind || this.candidate.pattern.length !== pattern.length ||
+        !(this.candidate.pattern + this.candidate.pattern).includes(pattern)) {
+      this.candidate = { since: now, chars: this.total, deltas: this.deltas, pattern, kind };
       return false;
     }
     return now - this.candidate.since >= 3000 && this.total - this.candidate.chars >= 256 &&
@@ -67,20 +49,27 @@ export class ArgumentRepetitionDetector {
   }
 }
 
-function periodicFragment(tail: string): string | undefined {
-  // Compare offsets, not whole repeated copies: the window need not divide the period.
-  for (let period = 1; period <= 8; period++) {
-    let matches = true;
-    for (let i = period; i < tail.length; i++) {
-      if (tail[i] !== tail[i - period]) { matches = false; break; }
-    }
-    if (!matches) continue;
-    const unit = tail.slice(0, period);
-    // Minimal periods 1/2 and punctuation-only padding are not this incident.
-    if (period < 3 || !/^[A-Za-z .]+$/.test(unit) || (unit.match(/[A-Za-z]/g)?.length ?? 0) !== 1 ||
-        (unit.match(/\./g)?.length ?? 0) !== 1 || !/ /.test(unit)) return;
-    return unit;
+/** Prefix function: finds minimal period even when window size is not divisible by it. */
+function minimalCycle(text: string): string | undefined {
+  const prefix = new Uint16Array(text.length);
+  for (let i = 1; i < text.length; i++) {
+    let j = prefix[i - 1];
+    while (j > 0 && text[i] !== text[j]) j = prefix[j - 1];
+    if (text[i] === text[j]) j++;
+    prefix[i] = j;
   }
+  const period = text.length - prefix[text.length - 1];
+  return period <= 64 && text.length >= period * 8 ? text.slice(0, period) : undefined;
+}
+
+function isInvisibleCycle(unit: string): boolean {
+  if (/^[\u200b\u200c]+$/.test(unit)) return true;
+  // A rotated raw-JSON cycle may begin/end midway through \u200b. Align a
+  // repeated sample at an escape boundary before validating every character.
+  const sample = unit.repeat(4);
+  const first = sample.indexOf("\\");
+  const last = sample.lastIndexOf("\\");
+  return first >= 0 && last > first && /^(?:\\u200[bc]|[\u200b\u200c])+$/i.test(sample.slice(first, last));
 }
 
 /** Wrap both native entry points once; retain the adapter's parsing and hooks. */
@@ -98,7 +87,7 @@ export function guardProviderStreams(api: ProviderStreams, now: () => number = (
       catch (error) { parent?.removeEventListener("abort", abort); throw error; }
       const output = createAssistantMessageEventStream();
       void (async () => {
-        const detectors = new Map<number, ArgumentRepetitionDetector>();
+        const detectors = new Map<string, StreamDegenerationDetector>();
         let partial: AssistantMessage | undefined;
         let tripped = false;
         let terminal = false;
@@ -121,16 +110,22 @@ export function guardProviderStreams(api: ProviderStreams, now: () => number = (
             }
             partial = event.partial;
             if (tripped) continue;
-            if (event.type === "toolcall_delta") {
-              let detector = detectors.get(event.contentIndex);
-              if (!detector) { detector = new ArgumentRepetitionDetector(); detectors.set(event.contentIndex, detector); }
-              const block = event.partial.content[event.contentIndex];
-              if (detector.observe(event.delta, block?.type === "toolCall" ? block.name : "", now()) && !parent?.aborted) {
+            if (event.type === "start") detectors.clear();
+            if (event.type === "toolcall_start" || event.type === "text_start" || event.type === "thinking_start") {
+              detectors.delete(`${event.type.replace("_start", "_delta")}:${event.contentIndex}`);
+            }
+            if (event.type === "toolcall_delta" || event.type === "text_delta" || event.type === "thinking_delta") {
+              const key = `${event.type}:${event.contentIndex}`;
+              let detector = detectors.get(key);
+              if (!detector) { detector = new StreamDegenerationDetector(); detectors.set(key, detector); }
+              if (detector.observe(event.delta, now()) && !parent?.aborted) {
                 tripped = true;
                 controller.abort(new Error(REPETITION_ERROR));
                 continue;
               }
-            } else if (event.type === "toolcall_end") detectors.delete(event.contentIndex);
+            } else if (event.type === "toolcall_end" || event.type === "text_end" || event.type === "thinking_end") {
+              detectors.delete(`${event.type.replace("_end", "_delta")}:${event.contentIndex}`);
+            }
             output.push(event);
           }
           if (!terminal && !partial) throw new Error("upstream_stream_read_error: stream ended without terminal event");

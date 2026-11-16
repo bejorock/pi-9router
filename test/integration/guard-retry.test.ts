@@ -10,12 +10,15 @@ import { test } from "node:test";
 // Exercise the production thresholds, native HTTP adapter, actual pi CLI retry
 // policy and enabled bash tool. No fake HTTP error or test-only detector tuning.
 for (const scenario of [
-  { status: 200, enabled: true, always: false, expectedRequests: 2, success: true },
-  { status: 201, enabled: true, always: false, expectedRequests: 2, success: true },
-  { status: 200, enabled: false, always: false, expectedRequests: 1, success: false },
-  { status: 200, enabled: true, always: true, expectedRequests: 2, success: false },
+  { channel: "bash", status: 200, enabled: true, always: false, expectedRequests: 2, success: true },
+  { channel: "bash", status: 201, enabled: true, always: false, expectedRequests: 2, success: true },
+  { channel: "bash", status: 200, enabled: false, always: false, expectedRequests: 1, success: false },
+  { channel: "bash", status: 200, enabled: true, always: true, expectedRequests: 2, success: false },
+  { channel: "find", status: 200, enabled: true, always: false, expectedRequests: 2, success: true },
+  { channel: "text", status: 200, enabled: true, always: false, expectedRequests: 2, success: true },
+  { channel: "thinking", status: 200, enabled: true, always: false, expectedRequests: 2, success: true },
 ]) {
-  test(`actual pi guard→retry HTTP${scenario.status} enabled=${scenario.enabled} always=${scenario.always}`, { timeout: 45000 }, async () => {
+  test(`actual pi ${scenario.channel} guard→retry HTTP${scenario.status} enabled=${scenario.enabled} always=${scenario.always}`, { timeout: 45000 }, async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-guard-integration-"));
     const marker = join(directory, "MUST_NOT_EXIST");
     const bodies: unknown[] = [];
@@ -37,12 +40,20 @@ for (const scenario of [
         response.end("data: [DONE]\n\n");
         return;
       }
-      send({ role: "assistant", tool_calls: [{ index: 0, id: "unfinished", type: "function", function: { name: "bash", arguments: '{"command":"touch ' + marker + '; echo ' + ' t. '.repeat(1100) } }] });
+      const invisible = scenario.channel === "find";
+      const cycle = invisible ? '\u200c\u200b'.repeat(8) : ' t. '.repeat(4);
+      const emit = (value: string, initial = false) => {
+        if (scenario.channel === "text") send({ ...(initial ? { role: "assistant" } : {}), content: value });
+        else if (scenario.channel === "thinking") send({ ...(initial ? { role: "assistant" } : {}), reasoning_content: value });
+        else send({ ...(initial ? { role: "assistant" } : {}), tool_calls: [{ index: 0, ...(initial ? { id: "unfinished", type: "function" } : {}), function: { ...(initial ? { name: scenario.channel } : {}), arguments: value } }] });
+      };
+      emit(invisible ? '{"pattern":"*","path":"' + '\u200c\u200b'.repeat(600) :
+        (scenario.channel === "bash" ? '{"command":"touch ' + marker + '; echo ' : '') + ' t. '.repeat(1100), true);
       // ~4 seconds of confirmed sustained degeneration after the initial tail.
       for (let i = 0; i < 110 && !response.destroyed; i++) {
         await sleep(50);
         if (response.destroyed) break;
-        send({ tool_calls: [{ index: 0, function: { arguments: ' t. '.repeat(4) } }] });
+        emit(cycle);
       }
       if (response.destroyed) disconnected++;
       else response.end("data: [DONE]\n\n");
@@ -57,7 +68,7 @@ for (const scenario of [
       // routes custom-only APIs through its global adapter when no base model
       // advertises that API, which would bypass this provider's stream wrapper.
       await writeFile(join(directory, "models-store.json"), JSON.stringify({ "9router": { checkedAt: Date.now(), models: [{ id: "probe", name: "Probe", provider: "9router", baseUrl: `http://127.0.0.1:${address.port}/v1`, api: "openai-completions", reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } }));
-      const child = spawn(process.execPath, [resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"), "--offline", "--no-extensions", "-e", resolve("src/index.ts"), "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-session", "--tools", "bash", "--api-key", "dummy", "--model", "9router/probe", "--thinking", "off", "--mode", "json", "-a", "-p", "Reply RETRY_RECOVERED."], { cwd: directory, env: { ...process.env, PI_CODING_AGENT_DIR: directory }, stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(process.execPath, [resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"), "--offline", "--no-extensions", "-e", resolve("src/index.ts"), "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-session", "--tools", "bash,find", "--api-key", "dummy", "--model", "9router/probe", "--thinking", "off", "--mode", "json", "-a", "-p", "Reply RETRY_RECOVERED."], { cwd: directory, env: { ...process.env, PI_CODING_AGENT_DIR: directory }, stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "", stderr = "";
       child.stdout.on("data", (chunk) => { stdout += chunk; });
       child.stderr.on("data", (chunk) => { stderr += chunk; });

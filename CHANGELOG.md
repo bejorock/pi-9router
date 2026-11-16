@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Generalize the request-only stream guard to all tool arguments, answer text, and exposed reasoning, with independent state per content block/channel. Detect sustained exact prose cycles and literal/JSON-escaped U+200B/U+200C cycles without tool-name, JSON-order, or quoted-content exemptions.
+- Add a second sanitized incident replay, healthy structured-output controls, and actual pi retry tests for `find`, answer text, and reasoning. Document detection gaps and the ambiguity of intentional long exact repetition. Preserve native retry budgets, request-only cancellation, and user cancellation.
 - Add a request-only prompt compatibility workaround exclusively for `9router/ag/*` using OpenAI Chat Completions: replace pi's exact default identity and remove only its recognized built-in documentation block. Preserve custom prompts, tools, project content, user/history messages, other models, and other providers.
 - Add model-switch, non-mutation, custom-docs, and actual pi wire-level isolation regression tests.
 

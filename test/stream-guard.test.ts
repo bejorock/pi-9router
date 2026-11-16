@@ -3,22 +3,22 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { createAssistantMessageEventStream, isRetryableAssistantError, normalizeContext } from "@earendil-works/pi-ai/compat";
 import type { AssistantMessage, AssistantMessageEvent, ProviderStreams, StreamOptions } from "@earendil-works/pi-ai";
-import { ArgumentRepetitionDetector, guardProviderStreams, REPETITION_ERROR } from "../src/stream-guard.ts";
+import { StreamDegenerationDetector, guardProviderStreams, REPETITION_ERROR } from "../src/stream-guard.ts";
 import { mapModel } from "../src/index.ts";
 
 const fixture = JSON.parse(readFileSync(new URL("./fixtures/argument-loop.json", import.meta.url), "utf8")) as { deltas: [number, string][] };
 
 test("replays the actual incident chunking and timing, stopping near 52s instead of 300s", () => {
-  const detector = new ArgumentRepetitionDetector();
-  const trigger = fixture.deltas.find(([ms, delta]) => detector.observe(delta, "bash", ms));
+  const detector = new StreamDegenerationDetector();
+  const trigger = fixture.deltas.find(([ms, delta]) => detector.observe(delta, ms));
   assert.ok(trigger);
   assert.ok(trigger[0] >= 50000 && trigger[0] <= 55000, String(trigger[0]));
 });
 
-function probe(text: string, chunkSize = 2, toolName = "bash") {
-  const detector = new ArgumentRepetitionDetector();
+function probe(text: string, chunkSize = 2) {
+  const detector = new StreamDegenerationDetector();
   for (let i = 0; i < text.length; i += chunkSize) {
-    if (detector.observe(text.slice(i, i + chunkSize), toolName, i * 20)) return true;
+    if (detector.observe(text.slice(i, i + chunkSize), i * 20)) return true;
   }
   return false;
 }
@@ -31,35 +31,51 @@ test("detects period3/4/6 cycles regardless of chunk coalescing or phase", () =>
   }
 });
 
-test("does not flag healthy repetition, other tools, completed commands or large single deltas", () => {
-  const commands = [
-    'echo ' + '-'.repeat(30000),
-    'echo ' + '. '.repeat(15000),
-    'echo ' + 'abc '.repeat(10000),
-    'echo ' + 'this is a test. '.repeat(6000),
-    'echo ' + 'ab.   '.repeat(6000),
-    'cat <<EOF\n' + ' t. '.repeat(10000),
-    'printf "' + ' t. '.repeat(10000) + '"',
-    "printf '" + ' t. '.repeat(10000) + "'",
-    'python -c ' + '[1,2,3],'.repeat(6000),
+test("preserves structured repetition, evolving prose, Unicode and large single deltas", () => {
+  const healthy = [
+    '-'.repeat(30000), '. '.repeat(15000),
+    'id,name,value\n' + '1,alpha,42\n'.repeat(6000),
+    '{"items":[' + '{"id":1,"value":"same"},'.repeat(4000),
+    'const value = 1;\n'.repeat(5000),
+    '[1,2,3],'.repeat(6000),
+    '👩‍💻 नमस्ते\u200c دنیا 中文\u200b。\n'.repeat(4000),
+    Array.from({ length: 6000 }, (_, i) => `This is observation number ${i}. `).join(''),
     Array.from({ length: 6000 }, (_, i) => `echo file_${i}; `).join(''),
   ];
-  for (const command of commands) assert.equal(probe(JSON.stringify({ command })), false, command.slice(0, 50));
+  for (const text of healthy) assert.equal(probe(text), false, text.slice(0, 50));
   const loop = '{"command":"' + ' t. '.repeat(10000);
   assert.equal(probe(loop, loop.length), false);
-  assert.equal(probe(loop, 2, "write"), false);
-  assert.equal(probe(loop, 2, ""), false);
-  assert.equal(probe('{"other":"' + ' t. '.repeat(10000)), false);
-  assert.equal(probe('{"command":"echo ok","other":"' + ' t. '.repeat(10000)), false);
+  assert.equal(probe(' t. '.repeat(400)), false, "short repeated sample");
+});
+
+test("intentionally detects long exact prose cycles even inside quotes, multiline payloads or arbitrary fields", () => {
+  // These were exclusions in the bash-only guard. They are intentionally no
+  // longer exemptions: sufficiently sustained identical prose is ambiguous.
+  for (const pattern of ['abc ', 'this is a test. ', 'ab.   ', 'Это повтор. ']) {
+    for (const prefix of ['{"other":"', '{"command":"ok","content":"', 'paragraph\n', 'printf "']) {
+      assert.equal(probe(prefix + pattern.repeat(10000)), true, prefix + pattern);
+    }
+  }
+});
+
+test("replays real invisible-path incident well before watchdog, including escaped JSON and chunk rotation", () => {
+  const invisible = JSON.parse(readFileSync(new URL('./fixtures/invisible-loop.json', import.meta.url), 'utf8')) as typeof fixture;
+  const detector = new StreamDegenerationDetector();
+  const trigger = invisible.deltas.find(([ms, delta]) => detector.observe(delta, ms));
+  assert.ok(trigger);
+  assert.ok(trigger[0] > 15000 && trigger[0] < 30000, String(trigger[0]));
+  for (const pattern of ['\u200b', '\u200c\u200b', '\\u200b\\u200c']) {
+    for (const size of [1, 2, 7, 64]) assert.equal(probe(pattern.repeat(15000), size), true, `${JSON.stringify(pattern)}/${size}`);
+  }
 });
 
 test("requires sustained time and progress, and resets on a broken cycle", () => {
-  const detector = new ArgumentRepetitionDetector();
-  assert.equal(detector.observe('{"command":"' + ' t. '.repeat(1200), "bash", 0), false);
-  for (let i = 1; i < 100; i++) assert.equal(detector.observe(' t. ', "bash", i), false);
-  assert.equal(detector.observe('different!', "bash", 10000), false);
-  assert.equal(detector.observe(' t. '.repeat(512), "bash", 10001), false);
-  assert.equal(detector.observe(' t. ', "bash", 20000), false); // insufficient new events
+  const detector = new StreamDegenerationDetector();
+  assert.equal(detector.observe('{"command":"' + ' t. '.repeat(1200), 0), false);
+  for (let i = 1; i < 100; i++) assert.equal(detector.observe(' t. ', i), false);
+  assert.equal(detector.observe('different!', 10000), false);
+  assert.equal(detector.observe(' t. '.repeat(512), 10001), false);
+  assert.equal(detector.observe(' t. ', 20000), false); // insufficient new events
 });
 
 function message(): AssistantMessage {
@@ -150,20 +166,21 @@ test("healthy native events pass through unchanged, including provider errors", 
   events.forEach((event, i) => assert.equal(event, original[i]));
 });
 
-test("parallel tool indices do not combine partial repeats or inherit tool names", async () => {
+test("a loop in an arbitrary write tool trips independently of healthy parallel tool", async () => {
   let clock = 0;
   const partial = message();
   partial.content.push({ type: "toolCall", id: "other", name: "write", arguments: {} });
-  const source = () => {
+  const source = (_model: unknown, _context: unknown, { signal }: StreamOptions = {}) => {
     const stream = createAssistantMessageEventStream();
     void (async () => {
       stream.push({ type: "start", partial });
       for (const [ms, delta] of fixture.deltas) {
         clock = ms;
-        // A real loop in a write payload must not arm bash's per-index detector.
+        // Tool names no longer grant exemptions; content indices stay isolated.
         stream.push({ type: "toolcall_delta", contentIndex: 1, delta, partial });
         stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "unique" + ms, partial });
         await new Promise<void>((resolve) => setImmediate(resolve));
+        if (signal?.aborted) break;
       }
       stream.push({ type: "done", reason: "stop", message: partial });
       stream.end();
@@ -171,15 +188,97 @@ test("parallel tool indices do not combine partial repeats or inherit tool names
     return stream;
   };
   const result = await guardProviderStreams({ stream: source, streamSimple: source }, () => clock).stream(model, context).result();
+  assert.equal(result.stopReason, "error");
+  assert.equal(result.errorMessage, REPETITION_ERROR);
+});
+
+test("answer and reasoning loops both cancel child and become native retryable errors", async () => {
+  for (const channel of ["text_delta", "thinking_delta"] as const) {
+    let clock = 0;
+    let aborted = false;
+    const source = (_model: unknown, _context: unknown, opts?: StreamOptions) => {
+      const output = createAssistantMessageEventStream();
+      const partial = message();
+      partial.content = channel === "text_delta" ? [{ type: "text", text: "" }] : [{ type: "thinking", thinking: "" }];
+      void (async () => {
+        output.push({ type: "start", partial });
+        for (let i = 0; i < 6000; i++) {
+          clock = i * 20;
+          output.push({ type: channel, contentIndex: 0, delta: "I keep repeating. ", partial });
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (opts?.signal?.aborted) { aborted = true; break; }
+        }
+        output.push({ type: "error", reason: "aborted", error: { ...partial, stopReason: "aborted" } });
+        output.end();
+      })();
+      return output;
+    };
+    const result = await guardProviderStreams({ stream: source, streamSimple: source }, () => clock).stream(model, context).result();
+    assert.equal(aborted, true, channel);
+    assert.equal(result.stopReason, "error");
+    assert.equal(result.errorMessage, REPETITION_ERROR);
+    assert.equal(isRetryableAssistantError(result), true);
+  }
+});
+
+test("same-index channels and separate blocks do not pool progress; block boundaries clear state", async () => {
+  let clock = 0;
+  const partial = message();
+  const source = () => {
+    const output = createAssistantMessageEventStream();
+    void (async () => {
+      output.push({ type: "start", partial });
+      // Enough content for a candidate but fewer than 64 subsequent deltas per
+      // channel/index. A shared detector would incorrectly pool these events.
+      for (const contentIndex of [0, 1]) {
+        for (const type of ["text_delta", "thinking_delta", "toolcall_delta"] as const) {
+          output.push({ type, contentIndex, delta: ' t. '.repeat(1100), partial });
+          for (let i = 0; i < 40; i++) {
+            clock += 100;
+            output.push({ type, contentIndex, delta: ' t. '.repeat(4), partial });
+            await new Promise<void>(resolve => setImmediate(resolve));
+          }
+        }
+      }
+      // Reuse the same index after each end. Each new block must start fresh.
+      output.push({ type: "text_end", contentIndex: 0, content: "", partial });
+      output.push({ type: "thinking_end", contentIndex: 0, content: "", partial });
+      output.push({ type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "done", name: "find", arguments: {} }, partial });
+      for (let i = 0; i < 40; i++) {
+        clock += 100;
+        for (const type of ["text_delta", "thinking_delta", "toolcall_delta"] as const) {
+          output.push({ type, contentIndex: 0, delta: ' t. '.repeat(4), partial });
+        }
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      // Defensive start reset: index 1 still has its old candidates. A fresh
+      // block start must reset them even if an adapter omitted the prior end.
+      output.push({ type: "text_start", contentIndex: 1, partial });
+      output.push({ type: "thinking_start", contentIndex: 1, partial });
+      output.push({ type: "toolcall_start", contentIndex: 1, partial });
+      for (const type of ["text_delta", "thinking_delta", "toolcall_delta"] as const) {
+        output.push({ type, contentIndex: 1, delta: ' t. '.repeat(1100), partial });
+        for (let i = 0; i < 40; i++) {
+          clock += 100;
+          output.push({ type, contentIndex: 1, delta: ' t. '.repeat(4), partial });
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+      }
+      output.push({ type: "done", reason: "stop", message: partial });
+      output.end();
+    })();
+    return output;
+  };
+  const result = await guardProviderStreams({ stream: source, streamSimple: source }, () => clock).stream(model, context).result();
   assert.equal(result.stopReason, "stop");
 });
 
 test("fixed guard error cannot be poisoned by command fragments matching billing exclusions", () => {
-  const detector = new ArgumentRepetitionDetector();
-  detector.observe('{"command":"echo billing quota exceeded; ', "bash", 0);
+  const detector = new StreamDegenerationDetector();
+  detector.observe('{"command":"echo billing quota exceeded; ', 0);
   let tripped = false;
   for (let i = 0; i < 4000; i++) {
-    if (detector.observe(' t. ', "bash", i * 20)) { tripped = true; break; }
+    if (detector.observe(' t. ', i * 20)) { tripped = true; break; }
   }
   assert.equal(tripped, true);
   assert.equal(isRetryableAssistantError({ ...message(), stopReason: "error", errorMessage: REPETITION_ERROR }), true);

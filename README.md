@@ -114,33 +114,41 @@ guidance. This is not a blanket removal of the word `pi` from project content.
 
 ## Repetitive-stream guard
 
-The provider's native stream is wrapped with a conservative guard for the observed
-unfinished `bash` argument loop (` t.  t.  t. …`). It does **not** ask the model to
-explain the failure or pretend an HTTP 503 occurred. The guard cancels only that
-request, emits a locally detected `upstream_stream_read_error`, and lets pi's
-native retry settings control backoff and the maximum number of retries. User
-cancellation remains cancellation, never a forced retry. No system-prompt
-instructions are added.
+The provider's native stream is wrapped with a conservative degeneration guard.
+It checks **all tool arguments, answer text, and exposed reasoning**, independently
+for each content block and channel. Tool names, JSON key order, quoted literals,
+and earlier newlines do not exempt a later repetitive tail. It does **not** judge
+whether an answer is correct or pretend an HTTP 503 occurred.
 
-Detection requires all of the following:
+Two exact-cycle signatures are currently recognized:
 
-- A known `bash` call, with `command` as the first JSON key and its string still unfinished.
-- At least 4,096 argument characters, ending in an exact 2,048-character periodic suffix.
-- A minimal cycle of 3–8 ASCII characters: exactly one letter, one period, and spaces (not general repeated prose, code, arrays, or padding).
-- The signature remains continuous for at least 3 seconds, 256 additional characters, and 64 additional nonempty argument deltas.
+- **Prose loops:** at least 4,096 generated characters, ending in a 2,048-character exact periodic suffix. The minimal cycle is at most 64 characters and contains Unicode letters, optional combining marks, spaces and `. ! ?`, with at least one letter and one space.
+- **Invisible loops:** at least 1,024 generated characters, ending in a 512-character exact periodic suffix made only of U+200B/U+200C, including raw JSON `\\u200b`/`\\u200c` escapes. Minimal cycles of one or two characters are allowed here.
+- **Both** must remain continuous for at least 3 seconds, 256 additional characters, and 64 additional nonempty deltas. Broken cycles reset confirmation. A single huge buffered delta does not trigger detection.
 
-The captured incident replays at **52.574 seconds** versus its original **299.963
-seconds**. This is evidence for that recording, not a guaranteed detection time.
-The detector holds only a bounded prefix/tail, and each tool call is checked
-independently. Incomplete calls are never repaired or executed.
+The sanitized real recordings retain their original chunk boundaries and timing:
+the old bash loop is detected near **53 seconds** rather than 300 seconds; the
+invisible `find` path loop is detected in **under 30 seconds** rather than 300
+seconds. These replay results are not guaranteed detection times. The detector
+keeps a bounded rolling tail rather than the entire response.
 
-**Scope and limitations:** this deliberately favors avoiding false positives over
-catching every loop. It does not detect silent streams, thinking/text loops,
-other tools, other JSON key orderings, multiline/heredoc commands, or repeated
-content inside an open quoted shell literal. A few very large buffered
-deltas may not satisfy the progress threshold. Legitimate unquoted repetition
-identical to the signature is indistinguishable and can cause a bounded retry.
-The guard depends on the built-in adapter honoring request cancellation.
+On detection, the guard cancels **only the current provider request** and emits a
+fixed `upstream_stream_read_error`. Pi's native retry settings control backoff and
+retry limits; disabled or exhausted retries stop normally with an error. User
+cancellation is never converted to a retry. The failed assistant response is
+discarded, including any completed calls within it; incomplete calls are never
+repaired or executed. Previously completed turns/tool results are retained. No
+whole-workflow restart or prompt instructions are added by the guard.
+
+**Scope and limitations:** this is a repetition heuristic, not a general detector
+of model confusion. It misses silence, nonrepeating nonsense, cycles longer than
+64 characters, and cycles containing digits, newlines or structural punctuation
+(such as repeated JSON/code rows). It does not inspect hidden reasoning. Normal
+structured CSV/JSON/code and evolving Unicode text have regression coverage, but
+intentional thousands-of-characters exact prose repetition—or long literal/escaped
+zero-width examples—is indistinguishable from a loop and can cause a bounded
+retry, even inside quoted tool content. Few very large buffered deltas may not
+satisfy confirmation. The guard depends on the adapter honoring cancellation.
 
 Pi 1.5.2 uses this native provider stream after its model catalog has been
 restored or discovered. A manually defined-only model on a fresh/offline install
@@ -160,7 +168,7 @@ npm run test:integration
 npm pack --dry-run
 ```
 
-Unit tests cover current/legacy model metadata, endpoint/auth composition, web-provider fallback, cancellation, output truncation, AG-only prompt rewriting/model-switch isolation, and a sanitized replay retaining the actual incident's chunk boundaries/timing. Integration tests start a local HTTP SSE server and actual pi process to prove AG prompt rewriting and other-provider payload equivalence, guard-triggered native retry over HTTP 200/201, disabled/exhausted retry budgets, request cancellation, and no tool execution. No real API keys are needed.
+Unit tests cover current/legacy model metadata, endpoint/auth composition, web-provider fallback, cancellation, output truncation, AG-only prompt rewriting/model-switch isolation, and two sanitized incident replays retaining their actual chunk boundaries/timing. Integration tests start a local HTTP SSE server and actual pi process to prove AG prompt rewriting and other-provider payload equivalence, guard-triggered native retry for tool arguments, text and reasoning over HTTP 200/201, disabled/exhausted retry budgets, request cancellation, and no tool execution. No real API keys are needed.
 
 ## License
 
