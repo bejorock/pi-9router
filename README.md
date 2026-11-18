@@ -112,9 +112,36 @@ unknown/future documentation templates and unrelated `<docs>` blocks are kept.
 The trade-off for AG requests is losing pi's automatic documentation-location
 guidance. This is not a blanket removal of the word `pi` from project content.
 
-## Repetitive-stream guard
+## Request guards
 
-The provider's native stream is wrapped with a conservative degeneration guard.
+### First-content timeout
+
+Each 9router chat request has **240 seconds to produce its first nonempty answer
+text, exposed reasoning, or tool-call argument delta**. Timing starts when the
+native stream is invoked, before response headers. Headers, start events, empty
+deltas and SSE keep-alive comments do not count as model content. Tool names alone
+do not count either. Any nonempty content (including whitespace) permanently
+disarms this deadline for that attempt; this is not an idle-between-tokens or total
+response-duration limit. Repetition detection remains separate.
+
+On expiry, the guard cancels only that request and immediately emits the retryable
+error `upstream_stream_read_error: no model content received within 240 seconds; request cancelled locally`.
+It does not wait for the adapter to acknowledge cancellation. Late events are
+ignored and the failed message is snapshotted. Pi's native retry settings still
+control whether/how often it retries; every new attempt gets its own deadline.
+User cancellation stays non-retryable. No new commands or configuration are added.
+
+This leaves nominal headroom before pi-workflow's default 300-second generation
+watchdog. A failed assistant completion clears that watchdog, allowing the next
+attempt to get a fresh generation window. This cannot guarantee recovery if
+startup/other hooks consume the headroom, a different workflow deadline is shorter,
+or the event loop is blocked. Legitimate hidden reasoning or long prompt processing
+can exceed four minutes and be interrupted. Upstream cancellation is best-effort;
+a retry may duplicate computation/cost even though no tool was executed.
+
+### Repetitive-stream guard
+
+The provider's native stream is also wrapped with a conservative degeneration guard.
 It checks **all tool arguments, answer text, and exposed reasoning**, independently
 for each content block and channel. Tool names, JSON key order, quoted literals,
 and earlier newlines do not exempt a later repetitive tail. It does **not** judge
@@ -141,7 +168,7 @@ repaired or executed. Previously completed turns/tool results are retained. No
 whole-workflow restart or prompt instructions are added by the guard.
 
 **Scope and limitations:** this is a repetition heuristic, not a general detector
-of model confusion. It misses silence, nonrepeating nonsense, cycles longer than
+of model confusion. It misses silence after first content, nonrepeating nonsense, cycles longer than
 64 characters, and cycles containing digits, newlines or structural punctuation
 (such as repeated JSON/code rows). It does not inspect hidden reasoning. Normal
 structured CSV/JSON/code and evolving Unicode text have regression coverage, but
@@ -150,7 +177,7 @@ zero-width examples—is indistinguishable from a loop and can cause a bounded
 retry, even inside quoted tool content. Few very large buffered deltas may not
 satisfy confirmation. The guard depends on the adapter honoring cancellation.
 
-Pi 1.5.2 uses this native provider stream after its model catalog has been
+**Both guards' provider scope:** Pi 1.5.2 uses this native provider stream after its model catalog has been
 restored or discovered. A manually defined-only model on a fresh/offline install
 can instead use pi's global API adapter and bypass this guard; open `/model`
 online to discover/cache the 9router catalog first. The guard is scoped to this
@@ -168,7 +195,7 @@ npm run test:integration
 npm pack --dry-run
 ```
 
-Unit tests cover current/legacy model metadata, endpoint/auth composition, web-provider fallback, cancellation, output truncation, AG-only prompt rewriting/model-switch isolation, and two sanitized incident replays retaining their actual chunk boundaries/timing. Integration tests start a local HTTP SSE server and actual pi process to prove AG prompt rewriting and other-provider payload equivalence, guard-triggered native retry for tool arguments, text and reasoning over HTTP 200/201, disabled/exhausted retry budgets, request cancellation, and no tool execution. No real API keys are needed.
+Unit tests cover current/legacy model metadata, endpoint/auth composition, web-provider fallback, cancellation, output truncation, AG-only prompt rewriting/model-switch isolation, and two sanitized incident replays retaining their actual chunk boundaries/timing. First-content unit tests verify the exact production 240-second boundary with virtual timers, uncooperative adapters, late events, empty deltas and user cancellation. Accelerated-deadline integration tests use a local server and actual pi to exercise pre-header silence, keep-alive-only streams, successful content, retry limits, HTTP cancellation and a workflow-style lifecycle watchdog. Integration tests also prove AG prompt rewriting and other-provider payload equivalence, guard-triggered native retry for tool arguments, text and reasoning over HTTP 200/201, disabled/exhausted retry budgets, request cancellation, and no tool execution. No real API keys are needed.
 
 ## License
 

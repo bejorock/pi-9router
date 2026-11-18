@@ -3,6 +3,15 @@ import type { AssistantMessage, ProviderStreams, StreamFunction } from "@earendi
 
 /** Fixed text: generated snippets must not influence pi's retry classifier. */
 export const REPETITION_ERROR = "upstream_stream_read_error: sustained repetitive generation detected locally; response discarded";
+export const FIRST_CONTENT_TIMEOUT_MS = 240_000;
+export const FIRST_CONTENT_TIMEOUT_ERROR = "upstream_stream_read_error: no model content received within 240 seconds; request cancelled locally";
+
+/** Injectable scheduler for deterministic tests; production always uses 240s. */
+type ScheduleDeadline = (callback: () => void, ms: number) => () => void;
+const scheduleDeadline: ScheduleDeadline = (callback, ms) => {
+  const timer = setTimeout(callback, ms);
+  return () => clearTimeout(timer);
+};
 const WINDOW = 2048;
 const INVISIBLE_WINDOW = 512;
 
@@ -73,24 +82,54 @@ function isInvisibleCycle(unit: string): boolean {
 }
 
 /** Wrap both native entry points once; retain the adapter's parsing and hooks. */
-export function guardProviderStreams(api: ProviderStreams, now: () => number = () => performance.now()): ProviderStreams {
+export function guardProviderStreams(
+  api: ProviderStreams,
+  now: () => number = () => performance.now(),
+  schedule: ScheduleDeadline = scheduleDeadline,
+): ProviderStreams {
   function wrap<T extends StreamFunction>(stream: T): T {
     return ((model, context, options) => {
       // Preserve synchronous setup failures (e.g. missing authentication).
       const controller = new AbortController();
       const parent = options?.signal;
-      const abort = () => controller.abort(parent?.reason);
+      const output = createAssistantMessageEventStream();
+      const startedAt = Date.now();
+      let partial: AssistantMessage | undefined;
+      let terminal = false;
+      let cancelDeadline: (() => void) | undefined;
+      const cleanup = () => {
+        cancelDeadline?.();
+        cancelDeadline = undefined;
+        parent?.removeEventListener("abort", abort);
+      };
+      const failImmediately = (errorMessage: string) => {
+        if (terminal) return;
+        terminal = true;
+        cleanup();
+        // Snapshot before abort: an uncooperative adapter may keep mutating its
+        // message after the public result has settled. Never expose that alias.
+        const failed: AssistantMessage = partial ? structuredClone(partial) : {
+          role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
+          timestamp: startedAt, stopReason: "pending",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        };
+        failed.stopReason = parent?.aborted ? "aborted" : "error";
+        failed.errorMessage = parent?.aborted ? "Request cancelled" : errorMessage;
+        controller.abort(parent?.aborted ? parent.reason : new Error(failed.errorMessage));
+        output.push({ type: "error", reason: failed.stopReason, error: failed });
+        output.end();
+      };
+      const abort = () => failImmediately("Request cancelled");
       if (parent?.aborted) abort();
       else parent?.addEventListener("abort", abort, { once: true });
+      // Arm before native setup, not after HTTP headers or an SSE start event.
+      if (!terminal) cancelDeadline = schedule(() => failImmediately(FIRST_CONTENT_TIMEOUT_ERROR), FIRST_CONTENT_TIMEOUT_MS);
       let inner;
       try { inner = stream(model, context, { ...options, signal: controller.signal }); }
-      catch (error) { parent?.removeEventListener("abort", abort); throw error; }
-      const output = createAssistantMessageEventStream();
+      catch (error) { cleanup(); throw error; }
       void (async () => {
         const detectors = new Map<string, StreamDegenerationDetector>();
-        let partial: AssistantMessage | undefined;
         let tripped = false;
-        let terminal = false;
         const finish = (message: AssistantMessage) => {
           const failed: AssistantMessage = {
             ...message,
@@ -103,6 +142,7 @@ export function guardProviderStreams(api: ProviderStreams, now: () => number = (
         };
         try {
           for await (const event of inner) {
+            if (terminal) break; // late events after deadline/cancellation are discarded
             if (event.type === "done" || event.type === "error") {
               if (tripped) finish(event.type === "done" ? event.message : event.error);
               else { output.push(event); terminal = true; }
@@ -115,6 +155,9 @@ export function guardProviderStreams(api: ProviderStreams, now: () => number = (
               detectors.delete(`${event.type.replace("_start", "_delta")}:${event.contentIndex}`);
             }
             if (event.type === "toolcall_delta" || event.type === "text_delta" || event.type === "thinking_delta") {
+              // Only actual content disarms the first-content deadline. Start,
+              // empty deltas, response headers and SSE comments do not qualify.
+              if (event.delta.length > 0) { cancelDeadline?.(); cancelDeadline = undefined; }
               const key = `${event.type}:${event.contentIndex}`;
               let detector = detectors.get(key);
               if (!detector) { detector = new StreamDegenerationDetector(); detectors.set(key, detector); }
@@ -136,6 +179,7 @@ export function guardProviderStreams(api: ProviderStreams, now: () => number = (
             } });
           }
         } catch (error) {
+          if (terminal) return;
           if (partial) {
             if (tripped) finish(partial);
             else output.push({ type: "error", reason: parent?.aborted ? "aborted" : "error", error: {
@@ -151,7 +195,7 @@ export function guardProviderStreams(api: ProviderStreams, now: () => number = (
             } });
           }
         } finally {
-          parent?.removeEventListener("abort", abort);
+          cleanup();
           output.end();
         }
       })();
